@@ -4,11 +4,13 @@
 #include <fcntl.h>
 #include <string>
 #include <sys/sysctl.h>
+#include <ps5/klog.h>
 extern "C"     int sceKernelGetProcessName(int pid, char *out);
 void write_log(const char* text)
 {
 	int text_len = printf("%s", text);
 	int fd = open("/data/etaHEN/injector_plugin.log", O_WRONLY | O_CREAT | O_APPEND, 0777);
+	klog_puts(text);
 	if (fd < 0)
 	{
 		return;

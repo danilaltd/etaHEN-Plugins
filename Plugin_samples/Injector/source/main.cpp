@@ -6,7 +6,10 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
-#include <dirent.h>
+
+#define ETAHEN_PATH "/data/etaHEN"
+#define PLUGIN_CONFIG_PATH ETAHEN_PATH "/Injector.ini"
+#define INJECTOR_DIR "/data/InjectorPlugin"
 
 extern "C"
 {
@@ -25,6 +28,11 @@ void sig_handler(int signo)
 }
 
 #define MAX_PROC_NAME 0x100
+
+bool file_exists(const char* filename) {
+    struct stat buff;
+    return stat(filename, &buff) == 0 ? true : false;
+}
 
 bool Get_Running_App_TID(std::string &title_id, int &BigAppid)
 {
@@ -105,52 +113,105 @@ int send_injector_data(const char *ip, int port,
 	return 0;
 }
 
-void send_all_payloads(){
-	const char* dir_path = "/data/InjectorPlugin";
-	DIR* dir = opendir(dir_path);
-    if (!dir) {
-        plugin_log("Cannot open directory: %s\n", dir_path);
+char* trim(char* str) {
+    char* end;
+    while (isspace((unsigned char)*str)) str++;
+    if (*str == 0) return str;
+    end = str + strlen(str) - 1;
+    while (end > str && isspace((unsigned char)*end)) end--;
+    end[1] = '\0';
+    return str;
+}
+
+void execute_payload_command(char * line) {
+	line = trim(line);
+    if (strlen(line) == 0 || line[0] == ';') return;
+
+    if (line[0] == '!') {
+        int seconds = atoi(line + 1);
+        plugin_log("Config: sleeping for %d seconds\n", seconds);
+        sleep(seconds);
         return;
     }
 
-    struct dirent* entry;
+    char fullpath[512];
+    snprintf(fullpath, sizeof(fullpath), "%s/%s", INJECTOR_DIR, line);
 
-    while ((entry = readdir(dir)) != NULL) {
+    struct stat st;
+    if (stat(fullpath, &st) < 0) {
+        plugin_log("File not found: %s\n", fullpath);
+        return;
+    }
 
-        if (strcmp(entry->d_name, ".") == 0 ||
-            strcmp(entry->d_name, "..") == 0)
-            continue;
-
-        char fullpath[512];
-        snprintf(fullpath, sizeof(fullpath), "%s/%s", dir_path, entry->d_name);
-
-        struct stat st;
-        if (stat(fullpath, &st) < 0 || !S_ISREG(st.st_mode))
-            continue;
-
-        plugin_log("Sending payload: %s (%lld bytes)\n",
-               fullpath, (long long)st.st_size);
-
-        FILE* f = fopen(fullpath, "rb");
-        if (!f) {
-            plugin_log("Cannot open file: %s\n", fullpath);
-            continue;
-        }
-
+    FILE* f = fopen(fullpath, "rb");
+    if (f) {
         uint8_t* buf = (uint8_t*)malloc(st.st_size);
         fread(buf, 1, st.st_size, f);
         fclose(f);
 
-        send_injector_data("127.0.0.1", 9033, "eboot.bin",  buf, st.st_size);
-
+        plugin_log("Injecting: %s\n", line);
+        if (send_injector_data("127.0.0.1", 9033, "eboot.bin", buf, st.st_size)) {
+            printf_notification("Injected: %s", line);
+        }
         free(buf);
-		sleep(1);
+    }
+}
+
+void process_config_section(const char* target_section) {
+	if (!file_exists(PLUGIN_CONFIG_PATH)) {
+        printf_notification("Not found gamepad.ini config file\n");
+        return;
     }
 
-    closedir(dir);
+
+    FILE* file = fopen(PLUGIN_CONFIG_PATH, "r");
+
+    if (!file) {
+        plugin_log("!file_open: %s (errno: %d)\n", strerror(errno), errno);
+        return;
+    }
+
+    char line[512];
+    char target_header[128];
+    snprintf(target_header, sizeof(target_header), "[%s]", target_section);
+
+    int in_target_section = 0;
+
+    while (fgets(line, sizeof(line), file)) {
+        char* trimmed = trim(line);
+        
+        if (trimmed[0] == '\0') continue;
+        
+        if (trimmed[0] == '[') {
+            if (strcmp(trimmed, target_header) == 0) {
+                in_target_section = 1;
+            } else {
+                in_target_section = 0;
+            }
+            continue;
+        }
+
+        if (in_target_section) {
+            execute_payload_command(trimmed);
+        }
+    }
+
+    fclose(file);
+}
+void send_all_payloads(const char * tid) {
+    printf_notification("Starting Injection Sequence");
+
+    plugin_log("Processing [default] section\n");
+    process_config_section("default");
+
+    plugin_log("Processing [%s] section\n", tid);
+    process_config_section(tid);
+
+    printf_notification("All payloads finished");
 }
 
 uintptr_t kernel_base = 0;
+bool plugin_just_started = true;
 int main()
 {
 	payload_args_t *args = payload_get_args();
@@ -165,30 +226,28 @@ int main()
 		sigaction(i, &new_SIG_action, NULL);
 
 	std::string tid;
-	int bappid, last_bappid;
+	int bappid, last_bappid = -1;
 	while (true)
 	{
-		if (!Get_Running_App_TID(tid, bappid))
+		if (Get_Running_App_TID(tid, bappid))
 		{
-			continue;
-		}
-
-		if ((bappid != last_bappid) && (tid.rfind("CUSA") != std::string::npos || tid.rfind("SCUS") != std::string::npos))
-		{
-			plugin_log("inject in 10s");
-			sleep(10);
-			int bappid_tmp;
-			if (!Get_Running_App_TID(tid, bappid_tmp))
-				continue;
-			plugin_log("inject now");
-			if (bappid == bappid_tmp)
+			if ((bappid != last_bappid) && (tid.rfind("CUSA") != std::string::npos || tid.rfind("SCUS") != std::string::npos))
 			{
-				send_all_payloads();
-				last_bappid = bappid;
-			} else {
-				plugin_log("maybe your app closed");
+				printf_notification("Game launch detected. Inject in 10s");
+				sleep(plugin_just_started ? 1 : 10);
+				int bappid_tmp;
+				if (!Get_Running_App_TID(tid, bappid_tmp))
+					continue;
+				if (bappid == bappid_tmp)
+				{
+					send_all_payloads(tid.c_str());
+					last_bappid = bappid;
+				} else {
+					plugin_log("Abort injection. Maybe your app closed");
+				}
 			}
 		}
+		plugin_just_started = false;
 		sleep(5);
 	}
 
